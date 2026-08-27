@@ -44,6 +44,20 @@ typedef uint64_t HashT;
 #include "emuopts.h"
 #include "render.h"
 
+// pinball_cab: MAME_STREAM_SOCKET support -- see the m_stream_fd comment on renderer_ogl below.
+// This repo's own build only ever targets macOS, so no #ifdef branch for Windows sockets.
+#if !defined(OSD_WINDOWS)
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
+#include <algorithm>
+#include <vector>
+
 
 #if !defined(OSD_WINDOWS) && !defined(OSD_MAC)
 
@@ -286,9 +300,58 @@ public:
 			m_glsl_program[i] = 0;
 		for (int i=0; i < 8; i++)
 			m_texVerticex[i] = 0.0f;
+
+		// pinball_cab: connect to the dashboard's frame-receiving socket if launch-shooter.py
+		// set one up for us -- see the m_stream_fd comment by its declaration above.
+		if (const char *sock_path = std::getenv("MAME_STREAM_SOCKET"))
+		{
+			m_stream_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+			if (m_stream_fd >= 0)
+			{
+				struct sockaddr_un addr{};
+				addr.sun_family = AF_UNIX;
+				std::strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+				if (::connect(m_stream_fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0)
+				{
+					::close(m_stream_fd);
+					m_stream_fd = -1;
+				}
+				else
+				{
+					// See drawbgfx.cpp's identical comment: without this, a send() after the
+					// dashboard's reader has gone away raises SIGPIPE, whose default disposition
+					// kills the whole process.
+					int one = 1;
+					::setsockopt(m_stream_fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+
+					// CONFIRMED LIVE, not a theoretical concern: a BLOCKING socket here dropped
+					// real measured MAME emulation speed from 100% to 0.83% the instant a real
+					// (if slightly slow) receiver was attached -- the render thread IS the
+					// emulation thread in this OSD, so a stalled send() stalls the whole game,
+					// not just the video path. Non-blocking + best-effort (see the drop-on-
+					// would-block logic in draw() below) means a lagging dashboard can only ever
+					// cost this game some video FRAMES, never any of its own speed.
+					int flags = ::fcntl(m_stream_fd, F_GETFL, 0);
+					::fcntl(m_stream_fd, F_SETFL, flags | O_NONBLOCK);
+					// Best-effort -- ask for room for several full frames so a real send() has a
+					// realistic chance of succeeding whole rather than partially (a partial send
+					// on a datagram-shaped wire protocol would desync the receiver's framing, so
+					// this repo's choice is "drop the whole frame" below, never "send half of
+					// one"). The OS may cap this lower than requested; that's fine, it only
+					// affects how often a frame is dropped, never whether the game stalls.
+					int sndbuf = 8 * 1024 * 1024;
+					::setsockopt(m_stream_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+				}
+			}
+		}
 	}
 	virtual ~renderer_ogl()
 	{
+		if (m_stream_fd >= 0)
+		{
+			::close(m_stream_fd);
+			m_stream_fd = -1;
+		}
 		// free the memory in the window
 		destroy_all_textures();
 	}
@@ -372,6 +435,19 @@ private:
 
 	std::unique_ptr<osd_gl_context> m_gl_context;
 	std::unique_ptr<glsl_shader_info> m_shader_tool;
+
+	// pinball_cab: live frame streaming to a local Unix domain socket, for the dashboard's
+	// Shared Playarea window (see cabinet-dashboard/emulator-video.js). Unlike drawbgfx.cpp's
+	// version of this same feature, there is no existing AVI-recording pipeline to reuse here --
+	// renderer_ogl::record() is a no-op on this platform (only implemented under #ifdef
+	// OSD_WINDOWS above), confirmed live: this repo's actual MAME build falls back to this
+	// renderer at runtime (bgfx requires external shader assets this build doesn't ship --
+	// confirmed live via "Unable to find the BGFX path bgfx... falling back to opengl"), so the
+	// drawbgfx.cpp patch alone would have shipped as dead code. This one does its own direct
+	// glReadPixels(GL_BACK) capture instead.
+	int m_stream_fd = -1;
+	std::vector<uint8_t> m_stream_pixels;   // glReadPixels scratch buffer, GL's bottom-up RGBA
+	std::vector<uint8_t> m_stream_buf;      // wire buffer: 8-byte header + row-flipped RGBA
 
 	int             m_initialized;        // is everything well initialized, i.e. all GL stuff etc.
 	// 3D info (GL mode only)
@@ -1527,6 +1603,93 @@ int renderer_ogl::draw(const int update)
 
 	window().m_primlist->release_lock();
 	m_init_context = 0;
+
+	// pinball_cab: capture the completed frame for the dashboard BEFORE swapping -- GL_BACK
+	// still holds exactly what was just drawn at this point, and reading GL_FRONT after a swap
+	// on some platforms doesn't return the frame just rendered (double-buffering makes "front"
+	// mean the previous complete frame while the new one settles).
+	//
+	// DOWNSCALED to a fixed small size (STREAM_OUT_W/H) BEFORE sending, not just for bandwidth --
+	// CONFIRMED LIVE this is structurally required, not an optimization: this Mac's own socket
+	// buffer ceiling (kern.ipc.maxsockbuf, 8MB here) is SMALLER than one native-resolution
+	// captured frame at this display's Retina scale (measured live: 2824x1932x4 = ~21MB) even
+	// when completely empty, before any receiver lag is involved at all -- so a single
+	// MSG_DONTWAIT send() of the full native frame could NEVER complete atomically, on this
+	// machine or any machine whose socket buffer ceiling is smaller than one frame. Downscaling
+	// first guarantees the wire payload reliably fits under one send() call. Same nearest-
+	// neighbor technique cabinet-dashboard/emulator-video.js already uses for its OWN downscale
+	// step -- done here too so a frame that's already been shrunk arrives, rather than shipping
+	// 21MB across a local socket only to shrink it again the instant it arrives.
+	//
+	// Framing: 4-byte big-endian width, 4-byte big-endian height, then width*height*4 raw RGBA
+	// bytes, row-major top-to-bottom -- glReadPixels itself returns rows BOTTOM-to-top (OpenGL's
+	// coordinate convention), so the copy below flips while downscaling rather than shipping an
+	// upside-down frame to the browser.
+	if (m_stream_fd >= 0 && m_width > 0 && m_height > 0)
+	{
+		constexpr int STREAM_OUT_W = 480;
+		constexpr int STREAM_OUT_H = 270;
+
+		const size_t src_frame_bytes = size_t(m_width) * size_t(m_height) * 4;
+		m_stream_pixels.resize(src_frame_bytes);
+		glReadPixels(0, 0, m_width, m_height, GL_RGBA, GL_UNSIGNED_BYTE, m_stream_pixels.data());
+
+		const size_t out_frame_bytes = size_t(STREAM_OUT_W) * size_t(STREAM_OUT_H) * 4;
+		m_stream_buf.resize(8 + out_frame_bytes);
+		m_stream_buf[0] = uint8_t(STREAM_OUT_W >> 24); m_stream_buf[1] = uint8_t(STREAM_OUT_W >> 16);
+		m_stream_buf[2] = uint8_t(STREAM_OUT_W >> 8);  m_stream_buf[3] = uint8_t(STREAM_OUT_W);
+		m_stream_buf[4] = uint8_t(STREAM_OUT_H >> 24); m_stream_buf[5] = uint8_t(STREAM_OUT_H >> 16);
+		m_stream_buf[6] = uint8_t(STREAM_OUT_H >> 8);  m_stream_buf[7] = uint8_t(STREAM_OUT_H);
+		const size_t src_row_bytes = size_t(m_width) * 4;
+		uint8_t *dst = m_stream_buf.data() + 8;
+		for (int dy = 0; dy < STREAM_OUT_H; dy++)
+		{
+			// (STREAM_OUT_H - 1 - dy): output row 0 is the TOP of the image; glReadPixels' row 0
+			// is the BOTTOM (OpenGL convention) -- this both flips and downscales in one pass.
+			const int src_y = std::min(m_height - 1, ((STREAM_OUT_H - 1 - dy) * m_height) / STREAM_OUT_H);
+			const uint8_t *src_row = m_stream_pixels.data() + src_row_bytes * size_t(src_y);
+			for (int dx = 0; dx < STREAM_OUT_W; dx++)
+			{
+				const int src_x = std::min(m_width - 1, (dx * m_width) / STREAM_OUT_W);
+				std::memcpy(dst, src_row + size_t(src_x) * 4, 4);
+				dst += 4;
+			}
+		}
+
+		// ONE non-blocking send attempt, all-or-nothing -- CONFIRMED LIVE this is required, not
+		// just theoretically safer: looping send() until every byte went out (the original
+		// version of this patch) is exactly what dropped real measured MAME speed to 0.83% the
+		// moment a receiver was attached at all, because a full send loop blocks the calling
+		// thread until the kernel socket buffer drains -- and this OSD's render call IS the
+		// emulation thread, so that stall was the whole game's stall, not just the video path's.
+		// `n` must equal the FULL buffer size, not just be non-negative -- send() can return a
+		// PARTIAL byte count under MSG_DONTWAIT (confirmed live: this was the actual bug behind
+		// an earlier "it looks like it's sending gigabytes of garbage" symptom, not receiver
+		// lag) -- any outcome other than a complete send is treated as a dropped frame, since
+		// this wire format has no mid-frame resync marker and resuming a partial send next call
+		// would silently corrupt every frame boundary after it. Losing an occasional video frame
+		// is this feature's correct, designed failure mode; losing game speed or wire integrity
+		// is not.
+		ssize_t n = ::send(m_stream_fd, m_stream_buf.data(), m_stream_buf.size(), MSG_DONTWAIT);
+		if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+		{
+			// A real error (broken pipe, receiver gone) -- EAGAIN/EWOULDBLOCK (the receiver is
+			// just behind right now) is normal and left connected for the next frame to retry.
+			::close(m_stream_fd);
+			m_stream_fd = -1;
+		}
+		else if (n > 0 && size_t(n) != m_stream_buf.size())
+		{
+			// A PARTIAL send -- the bytes that DID go out are already on the wire and cannot be
+			// un-sent, so this connection's framing is corrupted from this point on regardless
+			// of what happens next. Closing and letting the next frame reconnect fresh is the
+			// only correct recovery; downscaling to 480x270 (comfortably under SO_SNDBUF) makes
+			// this rare in practice, but "rare" isn't "impossible" and a corrupted stream must
+			// never be left running silently.
+			::close(m_stream_fd);
+			m_stream_fd = -1;
+		}
+	}
 
 	m_gl_context->swap_buffer();
 

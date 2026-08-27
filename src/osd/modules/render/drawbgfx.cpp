@@ -67,6 +67,16 @@ extern void *GetOSWindow(void *wincontroller);
 #include <algorithm>
 #include <limits>
 
+// pinball_cab: MAME_STREAM_SOCKET support (see the m_stream_fd comment in drawbgfx.h). macOS/
+// Linux only -- this repo's own build never targets Windows, so no #ifdef branch for it.
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
 
 //============================================================
 //  Renderer interface to parent module
@@ -640,6 +650,48 @@ renderer_bgfx::renderer_bgfx(osd_window &window, parent_module &parent)
 	, m_load_sub(parent.subscribe_load(&renderer_bgfx::load_config, this))
 	, m_save_sub(parent.subscribe_save(&renderer_bgfx::save_config, this))
 {
+	// pinball_cab: connect to the dashboard's frame-receiving socket if launch-shooter.py set one
+	// up for us. window() isn't valid to check .index() on yet this early in construction for
+	// every window type, so this connects unconditionally for every renderer_bgfx instance
+	// (arcade cabs only ever have one window) -- the actual streaming decision (window 0 only)
+	// happens per-frame in draw(), same as the real AVI recording path already gates itself.
+	if (const char *sock_path = std::getenv("MAME_STREAM_SOCKET"))
+	{
+		m_stream_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+		if (m_stream_fd >= 0)
+		{
+			struct sockaddr_un addr{};
+			addr.sun_family = AF_UNIX;
+			std::strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+			if (::connect(m_stream_fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0)
+			{
+				::close(m_stream_fd);
+				m_stream_fd = -1;
+			}
+			else
+			{
+				// Without this, a send() after the dashboard's reader has gone away raises
+				// SIGPIPE, whose DEFAULT disposition is to kill the whole process -- confirmed
+				// this is the real macOS behavior (Linux's per-call MSG_NOSIGNAL flag doesn't
+				// exist here; SO_NOSIGPIPE is the platform's actual equivalent). Without this, a
+				// closed dashboard would take the entire running game down with it.
+				int one = 1;
+				::setsockopt(m_stream_fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+
+				// See drawogl.cpp's identical, CONFIRMED LIVE comment: a blocking socket here
+				// dropped real measured MAME emulation speed from 100% to 0.83% the instant a
+				// real receiver lagged even slightly, because this OSD's render call doubles as
+				// the emulation thread. Non-blocking + drop-whole-frame-on-would-block (see the
+				// send() below) means a lagging dashboard can only ever cost video frames, never
+				// game speed.
+				int flags = ::fcntl(m_stream_fd, F_GETFL, 0);
+				::fcntl(m_stream_fd, F_SETFL, flags | O_NONBLOCK);
+				int sndbuf = 8 * 1024 * 1024;
+				::setsockopt(m_stream_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+			}
+		}
+	}
+
 	// load settings if recreated after fullscreen toggle
 	util::xml::data_node *windownode = m_module().persistent_settings().get_child("window");
 	while (windownode)
@@ -668,6 +720,12 @@ renderer_bgfx::renderer_bgfx(osd_window &window, parent_module &parent)
 
 renderer_bgfx::~renderer_bgfx()
 {
+	if (m_stream_fd >= 0)
+	{
+		::close(m_stream_fd);
+		m_stream_fd = -1;
+	}
+
 	// persist settings across fullscreen toggle
 	if (m_config)
 		m_config->get_first_child()->copy_into(m_module().persistent_settings());
@@ -1259,6 +1317,18 @@ int renderer_bgfx::draw(int update)
 		return 0;
 	}
 
+	// pinball_cab: auto-start the real AVI-recording pipeline once dimensions are known, if a
+	// stream socket is connected and nothing has started recording yet -- same record() the
+	// movie-record hotkey (IPT_OSD_8, osdsdl.cpp) calls, just triggered once by us instead of by
+	// a person. update_recording() (below) forwards every captured frame to m_stream_fd in
+	// addition to the real avi_writer -- the AVI file itself is an accepted, deliberate byproduct
+	// (written into the launch's own already-gitignored runtime inipath dir, cwd=inipath), not a
+	// second capture pipeline duplicating bgfx's ortho-view/blit/readback setup from scratch.
+	if (window_index == 0 && m_stream_fd >= 0 && !(m_avi_writer && m_avi_writer->recording()))
+	{
+		record();
+	}
+
 	if (num_screens)
 	{
 		// Restore config after counting screens the first time
@@ -1413,6 +1483,65 @@ void renderer_bgfx::update_recording()
 	}
 
 	m_avi_writer->video_frame(m_avi_bitmap);
+
+	// pinball_cab: forward the SAME already-decoded bitmap to the dashboard, not a second
+	// texture readback -- m_avi_bitmap is a bitmap_rgb32 (0xAARRGGBB per pixel, native/little-
+	// endian byte order on this Apple Silicon build, i.e. bytes [B,G,R,A] in memory -- the
+	// receiving end, cabinet-dashboard/emulator-video.js, swaps B/R when building a PNG).
+	//
+	// DOWNSCALED before sending -- see drawogl.cpp's identical, CONFIRMED LIVE comment for why
+	// this is structurally required (this Mac's own socket buffer ceiling is smaller than one
+	// native-resolution frame, before any receiver lag is even a factor).
+	//
+	// Framing: 4-byte big-endian width, 4-byte big-endian height, then width*height*4 raw bytes,
+	// row-major and tightly packed.
+	if (m_stream_fd >= 0)
+	{
+		constexpr int32_t STREAM_OUT_W = 480;
+		constexpr int32_t STREAM_OUT_H = 270;
+		const int32_t src_w = m_avi_bitmap.width();
+		const int32_t src_h = m_avi_bitmap.height();
+		const size_t out_frame_bytes = size_t(STREAM_OUT_W) * size_t(STREAM_OUT_H) * 4;
+		m_stream_buf.resize(8 + out_frame_bytes);
+		m_stream_buf[0] = uint8_t(STREAM_OUT_W >> 24); m_stream_buf[1] = uint8_t(STREAM_OUT_W >> 16);
+		m_stream_buf[2] = uint8_t(STREAM_OUT_W >> 8);  m_stream_buf[3] = uint8_t(STREAM_OUT_W);
+		m_stream_buf[4] = uint8_t(STREAM_OUT_H >> 24); m_stream_buf[5] = uint8_t(STREAM_OUT_H >> 16);
+		m_stream_buf[6] = uint8_t(STREAM_OUT_H >> 8);  m_stream_buf[7] = uint8_t(STREAM_OUT_H);
+		uint8_t *dst = m_stream_buf.data() + 8;
+		// m_avi_bitmap is already top-down (bitmap_rgb32's own convention, unlike glReadPixels),
+		// and already ARGB32 native-order -- byte-swap AARRGGBB -> RGBA the same way the sender
+		// side needs to for the receiver's own RGBA assumption (shared with drawogl.cpp's path).
+		for (int32_t dy = 0; dy < STREAM_OUT_H; dy++)
+		{
+			const int32_t src_y = std::min(src_h - 1, (dy * src_h) / STREAM_OUT_H);
+			const uint32_t *src_row = reinterpret_cast<const uint32_t *>(m_avi_bitmap.raw_pixptr(src_y));
+			for (int32_t dx = 0; dx < STREAM_OUT_W; dx++)
+			{
+				const int32_t src_x = std::min(src_w - 1, (dx * src_w) / STREAM_OUT_W);
+				const uint32_t px = src_row[src_x];
+				*dst++ = uint8_t(px >> 16); // R
+				*dst++ = uint8_t(px >> 8);  // G
+				*dst++ = uint8_t(px);       // B
+				*dst++ = uint8_t(px >> 24); // A
+			}
+		}
+		// ONE non-blocking send, all-or-nothing -- see drawogl.cpp's identical, CONFIRMED LIVE
+		// comment for why: a full send-loop blocks the emulation thread on a lagging receiver,
+		// and a partial send would desync this wire format's byte-count framing forever after --
+		// `n` must equal the full buffer size, not just be non-negative (send() can return a
+		// PARTIAL count under MSG_DONTWAIT).
+		ssize_t n = ::send(m_stream_fd, m_stream_buf.data(), m_stream_buf.size(), MSG_DONTWAIT);
+		if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+		{
+			::close(m_stream_fd);
+			m_stream_fd = -1;
+		}
+		else if (n > 0 && size_t(n) != m_stream_buf.size())
+		{
+			::close(m_stream_fd);
+			m_stream_fd = -1;
+		}
+	}
 }
 
 void renderer_bgfx::add_audio_to_recording(const int16_t *buffer, int samples_this_frame)

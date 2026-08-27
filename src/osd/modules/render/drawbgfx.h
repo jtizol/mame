@@ -154,6 +154,15 @@ private:
 	bitmap_rgb32 m_avi_bitmap;
 	std::unique_ptr<uint8_t []> m_avi_data;
 
+	// pinball_cab: live frame streaming to a local Unix domain socket, for the dashboard's
+	// Shared Playarea window (see cabinet-dashboard/emulator-video.js). Deliberately reuses the
+	// AVI recording pipeline above end to end (same m_avi_bitmap/m_avi_writer, same
+	// update_recording() call site) rather than duplicating bgfx's ortho-view/blit/readback
+	// setup a second time -- record() is called once automatically (see draw()) instead of
+	// waiting for the movie-record hotkey, so the ONLY new state here is the socket itself.
+	int m_stream_fd = -1;
+	std::vector<uint8_t> m_stream_buf;   // reused every frame, resized only when dimensions change
+
 	std::unique_ptr<util::xml::file> m_config;
 	const util::notifier_subscription m_load_sub;
 	const util::notifier_subscription m_save_sub;
